@@ -1,0 +1,13 @@
+# Core
+supabase==2.3.4
+python-dotenv==1.0.0
+requests>=2.31.0
+
+# Scraping
+aiohttp==3.9.3
+beautifulsoup4==4.12.3
+
+# AI & Embeddings
+google-genai==1.66.0
+sentence-transformers==3.4.1
+torch==2.6.0

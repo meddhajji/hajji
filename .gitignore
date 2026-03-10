@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.env
+
+# Transient pipeline data (regenerated each run)
+data-pipelines/avito_scraper/data/new.csv
+data-pipelines/avito_scraper/data/old.csv
+data-pipelines/avito_scraper/data/parsed.csv
+data-pipelines/avito_scraper/data/verified.csv
+data-pipelines/avito_scraper/data/good.csv
+
+# Node
+node_modules/
+.next/
+out/
+models_cache/
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
