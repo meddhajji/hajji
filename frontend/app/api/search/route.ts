@@ -2,8 +2,12 @@ import { NextRequest, NextResponse } from "next/server";
 import { pipeline, env } from "@huggingface/transformers";
 import { createClient } from "@supabase/supabase-js";
 
-// Force model cache into a local writable directory (fixes Windows EACCES error)
-env.cacheDir = "./models_cache";
+// Force dynamic rendering to prevent Next.js from trying to pre-render this route at build time.
+export const dynamic = "force-dynamic";
+
+// On Vercel serverless, only /tmp is writable. Locally, /tmp usually works too, 
+// or it will fallback to a default cache behavior if /tmp doesn't exist.
+env.cacheDir = "/tmp/models_cache";
 
 const supabase = createClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL || "https://placeholder.supabase.co",
