@@ -215,40 +215,53 @@ export default function AvitoPage() {
     const fetchLaptops = useCallback(async () => {
         setLoading(true);
 
-        // similarity search via API route
+        // text search via Supabase ilike (works on Vercel without heavy ML dependencies)
         if (committedSearch.trim()) {
-            try {
-                const res = await fetch(`/api/search?q=${encodeURIComponent(committedSearch.trim())}&count=200`);
-                const json = await res.json();
-                if (json.error) {
-                    console.error("Search error:", json.error);
-                    setLaptops([]);
-                    setTotal(0);
-                } else {
-                    let results = json.results as Laptop[];
-                    results = applyClientFilters(results, activeFilters);
+            const term = `%${committedSearch.trim()}%`;
+            let query = supabase
+                .from("laptops")
+                .select("*")
+                .or(`brand.ilike.${term},model.ilike.${term},cpu.ilike.${term},description.ilike.${term}`)
+                .limit(200);
 
-                    if (sortBy === "score") {
-                        results.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
-                    } else if (sortBy === "price") {
-                        results.sort((a, b) => (b.price ?? 0) - (a.price ?? 0));
-                    } else if (sortBy === "value") {
-                        results.sort((a, b) => {
-                            const va = (a.score ?? 0) / Math.max(a.price ?? 1, 1);
-                            const vb = (b.score ?? 0) / Math.max(b.price ?? 1, 1);
-                            return vb - va;
-                        });
-                    }
+            if (activeFilters.brand) query = query.ilike("brand", `%${activeFilters.brand}%`);
+            if (activeFilters.city) query = query.ilike("city", `%${activeFilters.city}%`);
+            if (activeFilters.gpu_type !== "all") query = query.ilike("gpu_type", activeFilters.gpu_type);
+            if (activeFilters.price_min) query = query.gte("price", parseFloat(activeFilters.price_min));
+            if (activeFilters.price_max) query = query.lte("price", parseFloat(activeFilters.price_max));
+            if (activeFilters.ram_min) query = query.gte("ram", parseFloat(activeFilters.ram_min));
+            if (activeFilters.storage_min) query = query.gte("storage", parseFloat(activeFilters.storage_min));
+            if (activeFilters.gpu_vram_min) query = query.gte("gpu_vram", parseFloat(activeFilters.gpu_vram_min));
+            if (activeFilters.screen_size_min) query = query.gte("screen_size", parseFloat(activeFilters.screen_size_min));
+            if (activeFilters.refresh_rate_min) query = query.gte("refresh_rate", parseFloat(activeFilters.refresh_rate_min));
+            if (activeFilters.is_new === true) query = query.eq("new", 1);
+            if (activeFilters.is_shop === true) query = query.eq("is_shop", true);
+            if (activeFilters.has_delivery === true) query = query.eq("has_delivery", true);
+            if (activeFilters.touchscreen === true) query = query.eq("touchscreen", 1);
+            if (activeFilters.ssd === true) query = query.eq("ssd", 1);
+            if (activeFilters.hide_sold) query = query.eq("is_sold", false);
 
-                    setTotal(results.length);
-                    const from = page * PAGE_SIZE;
-                    setLaptops(results.slice(from, from + PAGE_SIZE));
-                }
-            } catch (err) {
-                console.error("Search fetch failed:", err);
-                setLaptops([]);
-                setTotal(0);
+            if (sortBy === "score") {
+                query = query.order("score", { ascending: false, nullsFirst: false });
+            } else if (sortBy === "price") {
+                query = query.order("price", { ascending: false, nullsFirst: false });
             }
+
+            const { data, error } = await query;
+            if (error?.message) console.error("Search error:", error.message);
+
+            let results = (data || []) as Laptop[];
+            if (sortBy === "value") {
+                results.sort((a, b) => {
+                    const va = (a.score ?? 0) / Math.max(a.price ?? 1, 1);
+                    const vb = (b.score ?? 0) / Math.max(b.price ?? 1, 1);
+                    return vb - va;
+                });
+            }
+
+            setTotal(results.length);
+            const from = page * PAGE_SIZE;
+            setLaptops(results.slice(from, from + PAGE_SIZE));
             setLoading(false);
             return;
         }
