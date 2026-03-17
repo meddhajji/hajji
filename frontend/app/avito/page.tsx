@@ -109,7 +109,7 @@ const ALL_COLUMNS: ColDef[] = [
     { key: "gpu", label: "GPU", defaultOn: true, render: (l) => <span className="max-w-[120px] truncate block">{l.gpu || "—"}</span> },
     { key: "price", label: "Price", defaultOn: true, align: "right", render: (l) => l.price ? <span className="font-semibold">{l.price.toLocaleString()} DH</span> : "—" },
     { key: "city", label: "City", defaultOn: true, render: (l) => l.city || "—" },
-    { key: "new", label: "New", defaultOn: true, width: "w-[60px]", render: (l) => l.new === 1 ? <Badge variant="secondary" className="text-xs">New</Badge> : <span className="text-xs text-muted-foreground">Used</span> },
+    { key: "new", label: "New", defaultOn: true, width: "w-[60px]", render: (l) => l.new === 1 ? <Badge variant="secondary" className="text-xs">New</Badge> : (l.new === 0 ? <span className="text-xs text-muted-foreground">Used</span> : "—") },
     { key: "gpu_type", label: "GPU type", defaultOn: false, render: (l) => l.gpu_type || "—" },
     { key: "gpu_vram", label: "VRAM", defaultOn: false, align: "right", render: (l) => (l.gpu_vram != null ? `${l.gpu_vram}` : "—") },
     { key: "screen_size", label: "Screen", defaultOn: false, align: "right", render: (l) => (l.screen_size != null ? `${l.screen_size}"` : "—") },

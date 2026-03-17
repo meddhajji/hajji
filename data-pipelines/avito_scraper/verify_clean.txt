@@ -1,0 +1,35 @@
+﻿=== PIPELINE VERIFICATION ===
+
+Latest Pipeline Stats:
+  Created At: 2026-03-17T05:04:56.776983+00:00
+  New Items:  79
+
+Laptops Table:
+  Total Laptops:  16322
+  Active Laptops: 181
+  Sold Laptops:   16141
+
+Recently Parsed Laptops (Sample of 3):
+
+- Brand/Model: Dell Latitude 30
+  CPU: i5-1145g7 | RAM: 16GB | Storage: 256GB (SSD: 1)
+  GPU: Intel Iris Xe | Screen: 13" NoneHz
+  Price: 3300 DH | City: KΘnitra, Centre
+  Score: 324 | is_sold: False
+  Desc: dell latitude 30 i5 11 th 256 ssd 16gb a vendre dell latitude 13 30 bon etat avec
+
+- Brand/Model: Lenovo Thinkbook 16 G8
+  CPU: Ultra 5 210h | RAM: 16GB | Storage: 512GB (SSD: 1)
+  GPU: Intel Graphics | Screen: 16" NoneHz
+  Price: 7500 DH | City: Rabat, Quartier de l'OcΘan
+  Score: 304 | is_sold: False
+  Desc: lenovo thinkbook 16 g8 ultra 5 210h lenovo thinkbook 16 g8 intel core ultra 5 16gb
+
+- Brand/Model: Hp Omen
+  CPU: Ryzen 7 7840hs | RAM: 16GB | Storage: 500GB (SSD: None)
+  GPU: Rtx 4060 | Screen: 16" NoneHz
+  Price: 9400 DH | City: Oujda, CGI
+  Score: 660 | is_sold: False
+  Desc: hp omen amd ryzen 7 7840hs rtx 4060 2to hp omen processeur amd ryzen 7 7840hs ecran
+
+Items remaining in new_laptops staging: 1

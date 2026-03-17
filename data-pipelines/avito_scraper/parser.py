@@ -2,8 +2,8 @@
 """
 parser.py
 Reads items from the `new_laptops` staging table, parses specs with Gemini,
-generates embeddings, calculates scores, upserts into `laptops`, and deletes
-the processed rows from `new_laptops`.
+calculates scores, upserts into `laptops`, and deletes the processed rows
+from `new_laptops`.
 
 Loops until the staging table is empty.
 
@@ -16,13 +16,11 @@ import os
 import json
 import time
 import logging
-from pathlib import Path
 from datetime import datetime, timezone
 
 import requests
 from dotenv import load_dotenv
 from google import genai
-from sentence_transformers import SentenceTransformer
 
 from score_laptops import calc_laptop_score
 
@@ -34,9 +32,8 @@ logger = logging.getLogger(__name__)
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-MODEL = "gemini-2.0-flash-lite"
+MODEL = "gemini-3.1-flash-lite-preview"
 GEMINI_BATCH = 50    # items per Gemini API call
-EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 MAX_RETRIES = 3      # max parse attempts per item
 
 # Columns that Gemini must extract
@@ -158,7 +155,6 @@ def count_new_laptops() -> int:
         "Prefer": "count=exact",
     })
     resp.raise_for_status()
-    # The count is in the content-range header: "0-49/1234"
     cr = resp.headers.get("content-range", "*/0")
     total = cr.split("/")[-1]
     return int(total) if total != "*" else 0
@@ -225,7 +221,6 @@ def parse_batch_gemini(client, items: list[dict], retries: int = 3) -> list[dict
                 logger.error("Expected list, got %s", type(parsed))
                 return [{}] * len(items)
 
-            # Pad or trim to match input length
             while len(parsed) < len(items):
                 parsed.append({})
             parsed = parsed[:len(items)]
@@ -239,7 +234,7 @@ def parse_batch_gemini(client, items: list[dict], retries: int = 3) -> list[dict
             logger.error("API error (attempt %d): %s", attempt + 1, e)
 
         if attempt < retries - 1:
-            wait = 5 * (attempt + 1)
+            wait = 15 * (attempt + 1)
             logger.info("Retrying in %ds...", wait)
             time.sleep(wait)
 
@@ -247,7 +242,7 @@ def parse_batch_gemini(client, items: list[dict], retries: int = 3) -> list[dict
 
 
 # ---------------------------------------------------------------------------
-# Embedding & scoring
+# Scoring & row building
 # ---------------------------------------------------------------------------
 def truncate_description(desc: str, target: int = 80) -> str:
     if not desc or len(desc) <= target:
@@ -258,19 +253,8 @@ def truncate_description(desc: str, target: int = 80) -> str:
     return desc[:idx]
 
 
-def build_search_text(row: dict) -> str:
-    parts = [
-        row.get("brand") or "",
-        row.get("model") or "",
-        row.get("cpu") or "",
-        (row.get("description") or "")[:200],
-    ]
-    text = " ".join(p for p in parts if p).strip()
-    return text or "laptop"
-
-
-def to_db_row(raw_item: dict, specs: dict, embedding: list, now_str: str) -> dict:
-    """Merge raw scraped data + parsed specs + embedding + score into a DB row."""
+def to_db_row(raw_item: dict, specs: dict) -> dict:
+    """Merge raw scraped data + parsed specs + score into a DB row."""
     out = {}
 
     # Metadata from scraped item
@@ -311,9 +295,7 @@ def to_db_row(raw_item: dict, specs: dict, embedding: list, now_str: str) -> dic
         else:
             out[col] = str(val)
 
-    out["updated_at"] = now_str
-    out["is_sold"] = False  # Active item, always False
-    out["embedding"] = json.dumps(embedding)
+    out["is_sold"] = False  # Active item
     out["score"] = calc_laptop_score(out)
 
     return out
@@ -324,7 +306,6 @@ def is_valid_parse(specs: dict) -> bool:
     brand = specs.get("brand")
     cpu = specs.get("cpu")
     model = specs.get("model")
-    # At least one of brand, cpu, or model must be non-empty
     return bool(brand) or bool(cpu) or bool(model)
 
 
@@ -339,7 +320,6 @@ def main(max_items: int = None):
         print("Error: SUPABASE_URL/SUPABASE_KEY not found in .env")
         return
 
-    # Count how many items to process
     total = count_new_laptops()
     if total == 0:
         print("new_laptops table is empty. Nothing to process.")
@@ -349,28 +329,21 @@ def main(max_items: int = None):
         total = max_items
     print(f"Processing {total} items from new_laptops table...")
 
-    # Load models
     logger.info("Loading Gemini client...")
     gemini_client = genai.Client(api_key=GEMINI_KEY)
-    logger.info("Loading embedding model (%s)...", EMBED_MODEL)
-    embed_model = SentenceTransformer(EMBED_MODEL)
-    logger.info("Models loaded.")
+    logger.info("Gemini client loaded.")
 
-    now_str = datetime.now(timezone.utc).isoformat()
     processed = 0
-    failed_ids = set()  # track items that have failed multiple times
-    max_loops = (total // GEMINI_BATCH + 1) * MAX_RETRIES  # safety limit
+    failed_ids = set()
+    max_loops = (total // GEMINI_BATCH + 1) * MAX_RETRIES
 
     for loop in range(max_loops):
-        # Fetch a batch
         batch = fetch_new_laptops_batch(GEMINI_BATCH)
         if not batch:
-            break  # table is empty, done!
+            break
 
-        # Skip items that have already failed MAX_RETRIES times
         fresh_batch = [item for item in batch if item["id"] not in failed_ids]
         if not fresh_batch:
-            # All remaining items have failed too many times, give up
             logger.warning("All remaining %d items failed parsing. Stopping.", len(batch))
             break
 
@@ -382,14 +355,12 @@ def main(max_items: int = None):
         # Separate valid and invalid parses
         valid_items = []
         valid_specs = []
-        invalid_ids = []
 
         for item, specs in zip(fresh_batch, specs_list):
             if is_valid_parse(specs):
                 valid_items.append(item)
                 valid_specs.append(specs)
             else:
-                invalid_ids.append(item["id"])
                 failed_ids.add(item["id"])
                 logger.warning("Failed to parse item id=%d avito_id=%s", item["id"], item.get("avito_id"))
 
@@ -398,27 +369,17 @@ def main(max_items: int = None):
             time.sleep(5)
             continue
 
-        # Generate embeddings
-        merged_rows = []
-        for item, specs in zip(valid_items, valid_specs):
-            merged = {**item, **specs}  # needed for build_search_text
-            merged_rows.append(merged)
-
-        search_texts = [build_search_text(row) for row in merged_rows]
-        embeddings = embed_model.encode(search_texts, normalize_embeddings=True)
-
-        # Build DB rows
+        # Build DB rows (no embeddings needed)
         db_rows = []
         processed_ids = []
-        for item, specs, emb in zip(valid_items, valid_specs, embeddings):
-            db_row = to_db_row(item, specs, emb.tolist(), now_str)
+        for item, specs in zip(valid_items, valid_specs):
+            db_row = to_db_row(item, specs)
             db_rows.append(db_row)
             processed_ids.append(item["id"])
 
         # Upsert into laptops
         success = upsert_to_laptops(db_rows)
         if success:
-            # Delete from new_laptops
             delete_from_new_laptops(processed_ids)
             processed += len(processed_ids)
             remaining = count_new_laptops()
@@ -427,8 +388,8 @@ def main(max_items: int = None):
         else:
             logger.error("Upsert failed for batch, items remain in new_laptops for retry.")
 
-        # Rate limit: Gemini 15 RPM = 4s between calls
-        time.sleep(5)
+        # Rate limit: Gemini free tier (15 RPM)
+        time.sleep(10)
 
         if max_items and processed >= max_items:
             break
