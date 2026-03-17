@@ -1,54 +1,51 @@
 # -*- coding: utf-8 -*-
 """
 refresh.py
-Scrapes Avito, diffs against Supabase, outputs:
-  - new.csv   : items that are new OR have a changed price/laptop (need parsing)
-  - old.csv   : items in DB but not found in scrape (likely sold)
-
-Items that are literally identical (same id, same price, same description)
-are silently skipped.
-
-The "last scrape date" is derived from MAX(updated_at) in the database,
-no dedicated storage needed.
+Scrapes Avito, diffs against Supabase by LINK, and:
+  1. Inserts genuinely new items into the `new_laptops` staging table
+  2. PATCHes price changes directly in `laptops`
+  3. Marks items not found in the scrape as is_sold=True
+  4. Saves a stats row to `pipeline_stats`
 
 Usage:
     python refresh.py              # scrape 500 pages (default)
-    python refresh.py -p 50        # scrape 50 pages (quick test)
+    python refresh.py -p 5         # scrape 5 pages (quick test)
 """
 
 import asyncio
-import csv
-import re
 import logging
 import os
 import time
-from pathlib import Path
 from datetime import datetime
 
 import requests
 from dotenv import load_dotenv
-from scraper import scrape, CSV_COLUMNS, compress_text
+from scraper import scrape
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-OUTPUT_DIR = Path(__file__).parent / "data"
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
-# ---------------------------------------------------------------------------
-# Supabase helpers (REST API, no Python client needed)
-# ---------------------------------------------------------------------------
-def _sb_headers():
-    return {
+
+def _headers(content_type=True):
+    h = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
     }
+    if content_type:
+        h["Content-Type"] = "application/json"
+    return h
 
+
+# ---------------------------------------------------------------------------
+# Supabase helpers
+# ---------------------------------------------------------------------------
 def fetch_db_items():
-    """Fetch avito_id, price, description, link from Supabase."""
+    """Fetch link, avito_id, price from every row in laptops."""
     logger.info("Fetching current database items...")
     all_rows = []
     offset = 0
@@ -57,11 +54,11 @@ def fetch_db_items():
     while True:
         url = (
             f"{SUPABASE_URL}/rest/v1/laptops"
-            f"?select=avito_id,price,description,link"
-            f"&order=avito_id.asc"
+            f"?select=link,avito_id,price"
+            f"&order=id.asc"
             f"&offset={offset}&limit={step}"
         )
-        resp = requests.get(url, headers=_sb_headers())
+        resp = requests.get(url, headers=_headers(content_type=False))
         resp.raise_for_status()
         data = resp.json()
         if not data:
@@ -75,184 +72,189 @@ def fetch_db_items():
     return all_rows
 
 
-def fetch_last_scrape_date():
-    """Derive last scrape date from MAX(updated_at) in the database."""
-    url = (
-        f"{SUPABASE_URL}/rest/v1/laptops"
-        f"?select=updated_at"
-        f"&order=updated_at.desc"
-        f"&limit=1"
-    )
-    resp = requests.get(url, headers=_sb_headers())
-    resp.raise_for_status()
-    data = resp.json()
-    if data:
-        return data[0]["updated_at"]
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Similarity check (detect recycled listings)
-# ---------------------------------------------------------------------------
-def extract_url_title(link: str) -> str:
-    """Extract the title part from an Avito URL.
-    URL format: .../ordinateurs_portables/Model_Name_Here_57173341.htm
-    Returns: 'model name here' (lowercase, underscores replaced with spaces)
-    """
-    if not link:
-        return ""
-    try:
-        # Get filename from URL path
-        filename = link.rstrip("/").split("/")[-1]  # Model_Name_57173341.htm
-        filename = filename.replace(".htm", "")       # Model_Name_57173341
-        # Remove the trailing numeric ID (always the last _segment)
-        parts = filename.rsplit("_", 1)
-        if len(parts) == 2 and parts[1].isdigit():
-            title = parts[0]
+def insert_into_new_laptops(items: list[dict]):
+    """Batch-insert items into the new_laptops staging table."""
+    if not items:
+        return
+    batch_size = 200
+    for i in range(0, len(items), batch_size):
+        batch = items[i:i + batch_size]
+        payload = []
+        for item in batch:
+            payload.append({
+                "avito_id": str(item.get("avito_id", "")),
+                "description": str(item.get("description", "")),
+                "price": float(item.get("price", 0) or 0),
+                "city": str(item.get("city", "")),
+                "link": str(item.get("link", "")),
+                "is_shop": bool(item.get("is_shop", False)),
+                "has_delivery": bool(item.get("has_delivery", False)),
+            })
+        url = f"{SUPABASE_URL}/rest/v1/new_laptops"
+        resp = requests.post(url, headers=_headers(), json=payload)
+        if not resp.ok:
+            logger.error("Insert new_laptops failed: %d %s", resp.status_code, resp.text[:300])
         else:
-            title = filename
-        return title.lower().replace("_", " ").strip()
-    except Exception:
-        return ""
+            logger.info("Inserted batch %d-%d into new_laptops", i + 1, min(i + batch_size, len(items)))
+        time.sleep(0.1)
 
 
-def jaccard_similarity(s1: str, s2: str) -> float:
-    """Word-level Jaccard similarity between two strings."""
-    if not s1 or not s2:
-        return 0.0
-    words1 = set(s1.lower().split())
-    words2 = set(s2.lower().split())
-    if not words1 or not words2:
-        return 0.0
-    intersection = words1 & words2
-    union = words1 | words2
-    return len(intersection) / len(union)
+def patch_prices(updates: list[dict]):
+    """PATCH price for items with same link but different price."""
+    if not updates:
+        return
+    logger.info("Updating prices for %d items...", len(updates))
+    for item in updates:
+        link = item["link"]
+        new_price = float(item["price"])
+        url = f"{SUPABASE_URL}/rest/v1/laptops?link=eq.{requests.utils.quote(link, safe='')}"
+        resp = requests.patch(url, headers=_headers(), json={"price": new_price, "is_sold": False})
+        if not resp.ok:
+            logger.error("Price update failed for %s: %d %s", link, resp.status_code, resp.text[:200])
+        time.sleep(0.05)
+    logger.info("Price updates complete.")
+
+
+def mark_sold(links_not_found: set[str], db_items: list[dict]):
+    """Set is_sold=True for DB items whose link was NOT in the scrape."""
+    if not links_not_found:
+        return
+    logger.info("Marking %d items as sold...", len(links_not_found))
+    sold_ids = [str(row["avito_id"]) for row in db_items if row.get("link") in links_not_found]
+    batch_size = 100
+    for i in range(0, len(sold_ids), batch_size):
+        batch = sold_ids[i:i + batch_size]
+        ids_param = ",".join(batch)
+        url = f"{SUPABASE_URL}/rest/v1/laptops?avito_id=in.({ids_param})"
+        resp = requests.patch(url, headers=_headers(), json={"is_sold": True})
+        if not resp.ok:
+            logger.error("Mark sold failed: %d %s", resp.status_code, resp.text[:200])
+        time.sleep(0.1)
+    logger.info("Marked %d items as sold.", len(sold_ids))
+
+
+def unsell_active(links_found: set[str], db_items: list[dict]):
+    """Set is_sold=False for DB items that ARE in the scrape (un-sell relisted items)."""
+    # Only un-sell items that were previously sold
+    relisted_ids = [
+        str(row["avito_id"]) for row in db_items
+        if row.get("link") in links_found
+    ]
+    if not relisted_ids:
+        return
+    # We batch-update all found items to is_sold=False
+    # This is slightly redundant for items already False, but ensures consistency
+    batch_size = 500
+    for i in range(0, len(relisted_ids), batch_size):
+        batch = relisted_ids[i:i + batch_size]
+        ids_param = ",".join(batch)
+        url = f"{SUPABASE_URL}/rest/v1/laptops?avito_id=in.({ids_param})"
+        resp = requests.patch(url, headers=_headers(), json={"is_sold": False})
+        if not resp.ok:
+            logger.error("Un-sell failed: %d %s", resp.status_code, resp.text[:200])
+        time.sleep(0.1)
+    logger.info("Confirmed %d items as active (is_sold=False).", len(relisted_ids))
+
+
+def save_pipeline_stats(new_count: int):
+    """Insert a stats row into pipeline_stats."""
+    url = f"{SUPABASE_URL}/rest/v1/pipeline_stats"
+    payload = {"new_items": new_count}
+    resp = requests.post(url, headers=_headers(), json=payload)
+    if not resp.ok:
+        logger.error("Failed to save stats: %d %s", resp.status_code, resp.text[:200])
+    else:
+        logger.info("Saved pipeline stats: %d new items.", new_count)
 
 
 # ---------------------------------------------------------------------------
 # Diff logic
 # ---------------------------------------------------------------------------
-def diff(scraped_ads: list[dict], db_items: list[dict]):
+def diff_and_act(scraped_ads: list[dict], db_items: list[dict]):
     """
-    Compare scraped ads against database items.
+    Compare scraped ads against DB by LINK.
 
-    Returns:
-        new_items:  list of dicts to write to new.csv
-                    (brand new, price changed, or recycled listing)
-        old_items:  list of dicts to write to old.csv
-                    (in DB but not found in scrape)
+    Categories:
+      1. New link + new avito_id  -> insert into new_laptops
+      2. Same link + new price    -> PATCH price in laptops
+      3. New link + old avito_id  -> insert into new_laptops (overwrite via upsert)
+      4. DB link not in scrape    -> mark is_sold=True
+      5. Same link + same price   -> skip
     """
-    # Index DB by avito_id
-    db_index = {}
+    # Build DB indexes
+    db_links = {}        # link -> {avito_id, price}
+    db_avito_ids = set()
     for row in db_items:
+        link = str(row.get("link", "")).strip()
         aid = str(row.get("avito_id", "")).strip()
+        price = float(row.get("price", 0) or 0)
+        if link:
+            db_links[link] = {"avito_id": aid, "price": price}
         if aid:
-            db_index[aid] = row
+            db_avito_ids.add(aid)
 
-    scraped_ids = set()
-    new_items = []
+    # Categorize scraped items
+    new_items = []          # Categories 1 + 3 -> go to new_laptops
+    price_updates = []      # Category 2 -> PATCH directly
+    scraped_link_set = set()
+
+    stats = {"new": 0, "recycled": 0, "price_changed": 0, "unchanged": 0}
 
     for ad in scraped_ads:
+        link = str(ad.get("link", "")).strip()
         aid = str(ad.get("avito_id", "")).strip()
-        if not aid:
+        price = float(ad.get("price", 0) or 0)
+
+        if not link:
             continue
-        scraped_ids.add(aid)
+        scraped_link_set.add(link)
 
-        if aid not in db_index:
-            # brand new item
-            ad["_status"] = "new"
+        if link not in db_links:
+            # New link
+            if aid in db_avito_ids:
+                # Category 3: recycled avito_id (new laptop, same seller ID)
+                stats["recycled"] += 1
+            else:
+                # Category 1: genuinely new
+                stats["new"] += 1
             new_items.append(ad)
-            continue
+        else:
+            # Link exists in DB
+            db_price = db_links[link]["price"]
+            if abs(price - db_price) > 0.01:
+                # Category 2: price changed
+                stats["price_changed"] += 1
+                price_updates.append({"link": link, "price": price})
+            else:
+                # Category 5: unchanged
+                stats["unchanged"] += 1
 
-        db_row = db_index[aid]
+    # Category 4: DB items not found in scrape
+    db_link_set = set(db_links.keys())
+    links_not_found = db_link_set - scraped_link_set
+    links_found = db_link_set & scraped_link_set
 
-        # compare price
-        scraped_price = float(ad.get("price", 0) or 0)
-        db_price = float(db_row.get("price", 0) or 0)
-        price_changed = abs(scraped_price - db_price) > 0.01
+    # Log summary
+    logger.info("=" * 50)
+    logger.info("DIFF SUMMARY")
+    logger.info("=" * 50)
+    logger.info("  New items (new link+id):     %d", stats["new"])
+    logger.info("  Recycled (new link+old id):  %d", stats["recycled"])
+    logger.info("  Price changed:               %d", stats["price_changed"])
+    logger.info("  Unchanged (skipped):         %d", stats["unchanged"])
+    logger.info("  Not found (sold?):           %d", len(links_not_found))
+    logger.info("=" * 50)
 
-        # detect recycled listings using the short URL title (reliable)
-        scraped_title = extract_url_title(str(ad.get("link", "")))
-        db_title = extract_url_title(str(db_row.get("link", "")))
-        title_sim = jaccard_similarity(scraped_title, db_title)
-        is_recycled = title_sim < 0.3  # less than 30% word overlap = different laptop
+    # Act on each category
+    insert_into_new_laptops(new_items)
+    patch_prices(price_updates)
+    mark_sold(links_not_found, db_items)
+    unsell_active(links_found, db_items)
 
-        if is_recycled:
-            ad["_status"] = "recycled"
-            new_items.append(ad)
-        elif price_changed:
-            ad["_status"] = "price_changed"
-            new_items.append(ad)
-        # else: identical item, skip silently
+    total_new = stats["new"] + stats["recycled"]
+    save_pipeline_stats(total_new)
 
-    # Items in DB but not in scrape = potentially sold
-    old_items = []
-    for aid, row in db_index.items():
-        if aid not in scraped_ids:
-            old_items.append(row)
-
-    return new_items, old_items
-
-
-# ---------------------------------------------------------------------------
-# CSV output
-# ---------------------------------------------------------------------------
-NEW_CSV_COLUMNS = CSV_COLUMNS + ["_status"]
-
-def save_new_csv(items: list[dict], path: Path):
-    """Save new/changed items with a _status column."""
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=NEW_CSV_COLUMNS, extrasaction="ignore")
-        writer.writeheader()
-        for item in items:
-            row = {col: item.get(col, "") for col in NEW_CSV_COLUMNS}
-            writer.writerow(row)
-    logger.info("Saved %d items to %s", len(items), path)
-
-
-def save_old_csv(items: list[dict], path: Path):
-    """Save sold/not-found items (only the columns we fetched from DB)."""
-    cols = ["avito_id", "price", "description", "link"]
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
-        writer.writeheader()
-        for item in items:
-            writer.writerow({c: item.get(c, "") for c in cols})
-    logger.info("Saved %d items to %s", len(items), path)
-
-
-def mark_items_as_sold(old_items: list[dict]):
-    """Send PATCH request to Supabase to set is_sold=True for items not found."""
-    if not old_items:
-        return
-    logger.info("Marking %d items as sold in Supabase...", len(old_items))
-    batch_size = 100
-    for i in range(0, len(old_items), batch_size):
-        batch = old_items[i:i + batch_size]
-        ids = [str(item.get("avito_id", "")) for item in batch if item.get("avito_id")]
-        if not ids:
-            continue
-        ids_param = ",".join(ids)
-        url = f"{SUPABASE_URL}/rest/v1/laptops?avito_id=in.({ids_param})"
-        resp = requests.patch(url, headers=_sb_headers(), json={"is_sold": True})
-        if not resp.ok:
-            logger.error("Failed to mark sold items: %d %s", resp.status_code, resp.text[:200])
-        time.sleep(0.1)
-
-
-def save_pipeline_stats(new_count: int, updated_count: int, sold_count: int, total_count: int):
-    """Insert daily refresh stats into pipeline_stats table."""
-    logger.info("Saving pipeline stats to Supabase...")
-    url = f"{SUPABASE_URL}/rest/v1/pipeline_stats"
-    payload = {
-        "new_items": new_count,
-        "updated_items": updated_count,
-        "sold_items": sold_count,
-        "total_items": total_count
-    }
-    resp = requests.post(url, headers=_sb_headers(), json=payload)
-    if not resp.ok:
-        logger.error("Failed to save stats: %d %s", resp.status_code, resp.text[:200])
+    return total_new
 
 
 # ---------------------------------------------------------------------------
@@ -260,64 +262,25 @@ def save_pipeline_stats(new_count: int, updated_count: int, sold_count: int, tot
 # ---------------------------------------------------------------------------
 def main(max_pages: int = 500):
     start = datetime.now()
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        print("Error: SUPABASE_URL/SUPABASE_KEY not found in .env")
+        return
 
     # 1. Fetch current DB state
     db_items = fetch_db_items()
-    last_scrape = fetch_last_scrape_date()
-    logger.info("Last scrape date (from max updated_at): %s", last_scrape)
 
     # 2. Scrape Avito
     scraped_ads = asyncio.run(scrape(max_pages))
     logger.info("Scraped %d unique ads from %d pages.", len(scraped_ads), max_pages)
 
-    # 3. Diff
-    new_items, old_items = diff(scraped_ads, db_items)
+    # 3. Diff and act
+    new_count = diff_and_act(scraped_ads, db_items)
 
-    # Count by status
-    status_counts = {}
-    for item in new_items:
-        s = item.get("_status", "unknown")
-        status_counts[s] = status_counts.get(s, 0) + 1
-
-    # 4. Save files and update Supabase
-    new_path = OUTPUT_DIR / "new.csv"
-    old_path = OUTPUT_DIR / "old.csv"
-
-    save_new_csv(new_items, new_path)
-    save_old_csv(old_items, old_path)
-    mark_items_as_sold(old_items)
-
-    new_count = status_counts.get("new", 0)
-    updated_count = status_counts.get("price_changed", 0) + status_counts.get("recycled", 0)
-    sold_count = len(old_items)
-    
-    # We estimate total active items as previous total + new - sold
-    # Alternatively, len(scraped_ads) is the active scraped inventory.
-    total_count = len(scraped_ads)
-    
-    save_pipeline_stats(new_count, updated_count, sold_count, total_count)
-
-    # 5. Summary
+    # 4. Summary
     elapsed = (datetime.now() - start).total_seconds()
-    print("\n" + "=" * 50)
-    print("REFRESH SUMMARY")
-    print("=" * 50)
-    print(f"Database items:        {len(db_items)}")
-    print(f"Scraped items:         {len(scraped_ads)}")
-    print(f"Last scrape date:      {last_scrape}")
-    print()
-    for status, count in sorted(status_counts.items()):
-        print(f"  {status:18s}   {count}")
-    print(f"  {'total changes':18s}   {len(new_items)}")
-    print()
-    print(f"Not found (sold?):     {len(old_items)}")
-    print(f"Unchanged (skipped):   {len(scraped_ads) - len(new_items) - len(old_items)}")
-    print()
-    print(f"Saved: {new_path}")
-    print(f"       {old_path}")
-    print(f"Time:  {elapsed:.1f}s")
-    print("=" * 50)
+    print(f"\nRefresh complete in {elapsed:.1f}s")
+    print(f"  {new_count} items inserted into new_laptops for parsing")
 
 
 if __name__ == "__main__":

@@ -107,7 +107,7 @@ const ALL_COLUMNS: ColDef[] = [
     { key: "ram", label: "RAM", defaultOn: true, align: "right", render: (l) => (l.ram != null ? `${l.ram}` : "—") },
     { key: "storage", label: "Storage", defaultOn: true, align: "right", render: (l) => (l.storage != null ? `${l.storage}` : "—") },
     { key: "gpu", label: "GPU", defaultOn: true, render: (l) => <span className="max-w-[120px] truncate block">{l.gpu || "—"}</span> },
-    { key: "price", label: "Price", defaultOn: true, align: "right", render: (l) => l.is_sold ? <Badge variant="destructive" className="text-[10px] uppercase font-bold tracking-wider opacity-80 py-0 leading-tight">Sold</Badge> : (l.price ? <span className="font-semibold">{l.price.toLocaleString()} DH</span> : "—") },
+    { key: "price", label: "Price", defaultOn: true, align: "right", render: (l) => l.price ? <span className="font-semibold">{l.price.toLocaleString()} DH</span> : "—" },
     { key: "city", label: "City", defaultOn: true, render: (l) => l.city || "—" },
     { key: "new", label: "New", defaultOn: true, width: "w-[60px]", render: (l) => l.new === 1 ? <Badge variant="secondary" className="text-xs">New</Badge> : <span className="text-xs text-muted-foreground">Used</span> },
     { key: "gpu_type", label: "GPU type", defaultOn: false, render: (l) => l.gpu_type || "—" },
@@ -121,6 +121,13 @@ const ALL_COLUMNS: ColDef[] = [
     { key: "link", label: "Link", defaultOn: false, render: (l) => l.link ? <a href={l.link} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:underline text-xs">Avito ↗</a> : "—" },
     { key: "description", label: "Description", defaultOn: false, render: (l) => <span className="max-w-[200px] truncate block text-xs">{l.description || "—"}</span> },
     { key: "avito_id", label: "Avito ID", defaultOn: false, render: (l) => <span className="text-xs">{l.avito_id || "—"}</span> },
+    { key: "status", label: "Status", defaultOn: true, width: "w-[70px]", align: "center", render: (l) => {
+        if (l.is_sold) return <Badge variant="destructive" className="text-[10px] uppercase font-bold tracking-wider opacity-80 py-0 leading-tight">Sold</Badge>;
+        const created = new Date(l.created_at);
+        const hoursAgo = (Date.now() - created.getTime()) / (1000 * 60 * 60);
+        if (hoursAgo < 48) return <Badge className="bg-emerald-500/20 text-emerald-400 border-emerald-500/30 text-[10px] uppercase font-bold tracking-wider py-0 leading-tight">New!</Badge>;
+        return null;
+    }},
 ];
 
 const DEFAULT_VISIBLE = new Set(ALL_COLUMNS.filter((c) => c.defaultOn).map((c) => c.key));
@@ -138,7 +145,7 @@ export default function AvitoPage() {
     });
     const [filterOpen, setFilterOpen] = useState(false);
     const [sortBy, setSortBy] = useState<SortOption>("default");
-    const [stats, setStats] = useState<{ created_at: string; new_items: number; updated_items: number; sold_items: number; total_items: number; } | null>(null);
+    const [lastUpdate, setLastUpdate] = useState<{ created_at: string; new_items: number } | null>(null);
 
     // column toggle
     const [visibleCols, setVisibleCols] = useState<Set<string>>(new Set(DEFAULT_VISIBLE));
@@ -182,12 +189,12 @@ export default function AvitoPage() {
             }
             setGpuTypes([...new Set(all)].sort());
         }
-        async function loadStats() {
-            const { data } = await supabase.from("pipeline_stats").select("*").order("created_at", { ascending: false }).limit(1).single();
-            if (data) setStats(data as any);
+        async function loadLastUpdate() {
+            const { data } = await supabase.from("pipeline_stats").select("created_at,new_items").order("created_at", { ascending: false }).limit(1).single();
+            if (data) setLastUpdate(data as { created_at: string; new_items: number });
         }
         loadGpuTypes();
-        loadStats();
+        loadLastUpdate();
     }, []);
 
     function applyClientFilters(rows: Laptop[], f: Filters): Laptop[] {
@@ -410,28 +417,18 @@ export default function AvitoPage() {
                                 <DialogHeader>
                                     <DialogTitle>Pipeline Statistics</DialogTitle>
                                 </DialogHeader>
-                                {stats ? (
+                                {lastUpdate ? (
                                     <>
                                         <div className="grid grid-cols-2 gap-4 py-4">
                                             <div className="space-y-1">
-                                                <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Active Inventory</p>
-                                                <p className="text-3xl font-bold font-mono tracking-tight">{stats.total_items.toLocaleString()}</p>
-                                                <p className="text-xs text-muted-foreground">Stored laptops</p>
+                                                <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Total Inventory</p>
+                                                <p className="text-3xl font-bold font-mono tracking-tight">{total.toLocaleString()}</p>
+                                                <p className="text-xs text-muted-foreground">Laptops in database</p>
                                             </div>
                                             <div className="space-y-1">
                                                 <p className="text-[11px] font-semibold uppercase tracking-wider text-emerald-500">Newly Added</p>
-                                                <p className="text-3xl font-bold font-mono tracking-tight text-emerald-400">+{stats.new_items.toLocaleString()}</p>
-                                                <p className="text-xs text-muted-foreground">in the last 24h</p>
-                                            </div>
-                                            <div className="space-y-1">
-                                                <p className="text-[11px] font-semibold uppercase tracking-wider text-blue-500">Price Drops</p>
-                                                <p className="text-3xl font-bold font-mono tracking-tight text-blue-400">{stats.updated_items.toLocaleString()}</p>
-                                                <p className="text-xs text-muted-foreground">Updates processed</p>
-                                            </div>
-                                            <div className="space-y-1">
-                                                <p className="text-[11px] font-semibold uppercase tracking-wider text-red-500">Sold Items</p>
-                                                <p className="text-3xl font-bold font-mono tracking-tight text-red-400">-{stats.sold_items.toLocaleString()}</p>
-                                                <p className="text-xs text-muted-foreground">Removed remotely</p>
+                                                <p className="text-3xl font-bold font-mono tracking-tight text-emerald-400">+{lastUpdate.new_items.toLocaleString()}</p>
+                                                <p className="text-xs text-muted-foreground">In the last refresh</p>
                                             </div>
                                         </div>
                                         <div className="text-[11px] text-muted-foreground flex items-center justify-between border-t border-border/50 pt-3 mt-1">
@@ -440,9 +437,9 @@ export default function AvitoPage() {
                                                     <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
                                                     <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
                                                 </span>
-                                                Updated: {new Date(stats.created_at).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}
+                                                Updated: {new Date(lastUpdate.created_at).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}
                                             </span>
-                                            <span>Gemini 3.1 & BAAI Embeddings</span>
+                                            <span>Gemini 2.0 &amp; BAAI Embeddings</span>
                                         </div>
                                     </>
                                 ) : (
@@ -677,7 +674,7 @@ export default function AvitoPage() {
                             </TableRow>
                         ) : (
                             laptops.map((l) => (
-                                <TableRow key={l.id}>
+                                <TableRow key={l.id} className={l.is_sold ? "opacity-50" : ""}>
                                     {activeCols.map((c) => (
                                         <TableCell
                                             key={c.key}
@@ -729,6 +726,13 @@ export default function AvitoPage() {
                     </div>
                 )
             }
+
+            {/* last updated footer */}
+            {lastUpdate && (
+                <p className="text-xs text-muted-foreground text-center pt-2">
+                    Last update {new Date(lastUpdate.created_at).toLocaleDateString("en-GB")}, {lastUpdate.new_items} items added
+                </p>
+            )}
 
         </div >
     );

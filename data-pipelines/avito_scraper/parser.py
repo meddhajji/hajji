@@ -1,23 +1,30 @@
 # -*- coding: utf-8 -*-
 """
 parser.py
-Parses raw Avito laptop descriptions into structured specs using Gemini API.
-Reads new.csv (from refresh.py), processes in batches of 400, outputs parsed.csv.
+Reads items from the `new_laptops` staging table, parses specs with Gemini,
+generates embeddings, calculates scores, upserts into `laptops`, and deletes
+the processed rows from `new_laptops`.
+
+Loops until the staging table is empty.
 
 Usage:
-    python parser.py                 # parse all items in data/new.csv
-    python parser.py -n 50           # parse only the first 50 items (test)
+    python parser.py                 # process all items
+    python parser.py -n 50           # process only the first 50 items (test)
 """
 
 import os
-import csv
 import json
 import time
 import logging
 from pathlib import Path
+from datetime import datetime, timezone
 
+import requests
 from dotenv import load_dotenv
 from google import genai
+from sentence_transformers import SentenceTransformer
+
+from score_laptops import calc_laptop_score
 
 load_dotenv()
 
@@ -25,29 +32,25 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
-MODEL = "gemini-3.1-flash-lite-preview"
-API_CHUNK = 50       # items per Gemini API call (keep small for reliability)
-REPORT_EVERY = 100   # print progress every N items
-INPUT_FILE = Path(__file__).parent / "data" / "new.csv"
-OUTPUT_FILE = Path(__file__).parent / "data" / "parsed.csv"
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+MODEL = "gemini-2.0-flash-lite"
+GEMINI_BATCH = 50    # items per Gemini API call
+EMBED_MODEL = "BAAI/bge-small-en-v1.5"
+MAX_RETRIES = 3      # max parse attempts per item
 
-# Columns that Gemini must extract (the spec columns)
+# Columns that Gemini must extract
 SPEC_COLS = [
     "brand", "model", "cpu", "ram", "storage", "ssd",
     "gpu", "gpu_type", "gpu_vram",
     "screen_size", "refresh_rate", "new", "touchscreen",
 ]
 
-# Full output columns matching good.csv exactly
-ALL_COLS = [
-    "avito_id", "description", "price", "city", "link",
-    "is_shop", "has_delivery",
-    "brand", "model", "cpu", "ram", "storage", "ssd",
-    "gpu", "gpu_type", "gpu_vram",
-    "screen_size", "refresh_rate", "new", "touchscreen",
-]
+NUMERIC_COLS = ["price", "ram", "storage", "ssd", "gpu_vram",
+                "screen_size", "refresh_rate", "new", "touchscreen"]
+BOOL_COLS = ["is_shop", "has_delivery"]
 
-# 3 reference examples from good.csv showing the exact format we want
+# 3 reference examples
 EXAMPLES = """[
   {
     "brand": "Lenovo",
@@ -118,18 +121,84 @@ Here are 3 reference examples showing the exact output format:
 {EXAMPLES}"""
 
 
-def build_prompt(descriptions: list[dict]) -> str:
-    """Build the user prompt with numbered descriptions."""
+# ---------------------------------------------------------------------------
+# Supabase helpers
+# ---------------------------------------------------------------------------
+def _sb_headers(prefer="return=minimal"):
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": prefer,
+    }
+
+
+def fetch_new_laptops_batch(limit: int = GEMINI_BATCH) -> list[dict]:
+    """Fetch a batch of rows from new_laptops."""
+    url = (
+        f"{SUPABASE_URL}/rest/v1/new_laptops"
+        f"?select=*"
+        f"&order=id.asc"
+        f"&limit={limit}"
+    )
+    resp = requests.get(url, headers={
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+    })
+    resp.raise_for_status()
+    return resp.json()
+
+
+def count_new_laptops() -> int:
+    """Count remaining rows in new_laptops."""
+    url = f"{SUPABASE_URL}/rest/v1/new_laptops?select=id"
+    resp = requests.get(url, headers={
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Prefer": "count=exact",
+    })
+    resp.raise_for_status()
+    # The count is in the content-range header: "0-49/1234"
+    cr = resp.headers.get("content-range", "*/0")
+    total = cr.split("/")[-1]
+    return int(total) if total != "*" else 0
+
+
+def delete_from_new_laptops(ids: list[int]):
+    """Delete processed rows from new_laptops by their id."""
+    if not ids:
+        return
+    ids_param = ",".join(str(i) for i in ids)
+    url = f"{SUPABASE_URL}/rest/v1/new_laptops?id=in.({ids_param})"
+    resp = requests.delete(url, headers=_sb_headers())
+    if not resp.ok:
+        logger.error("Delete from new_laptops failed: %d %s", resp.status_code, resp.text[:200])
+
+
+def upsert_to_laptops(rows: list[dict]):
+    """Upsert rows into the laptops table (on_conflict=avito_id)."""
+    url = f"{SUPABASE_URL}/rest/v1/laptops?on_conflict=avito_id"
+    resp = requests.post(url, headers=_sb_headers("return=minimal,resolution=merge-duplicates"), json=rows)
+    if not resp.ok:
+        logger.error("Upsert failed: %d %s", resp.status_code, resp.text[:300])
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Gemini parsing
+# ---------------------------------------------------------------------------
+def build_prompt(items: list[dict]) -> str:
     lines = []
-    for i, item in enumerate(descriptions):
+    for i, item in enumerate(items):
         desc = item.get("description", "")
         lines.append(f"{i+1}. {desc}")
     return "Extract specs from these laptop descriptions:\n\n" + "\n".join(lines)
 
 
-def parse_batch(client, descriptions: list[dict], retries: int = 3) -> list[dict]:
-    """Send a batch to Gemini and parse the JSON response. Retries on failure."""
-    prompt = build_prompt(descriptions)
+def parse_batch_gemini(client, items: list[dict], retries: int = 3) -> list[dict]:
+    """Send a batch to Gemini and parse the JSON response."""
+    prompt = build_prompt(items)
 
     for attempt in range(retries):
         try:
@@ -143,7 +212,7 @@ def parse_batch(client, descriptions: list[dict], retries: int = 3) -> list[dict
 
             text = response.text.strip()
 
-            # Strip markdown fences if the model wraps them
+            # Strip markdown fences
             if text.startswith("```"):
                 text = text.split("\n", 1)[1] if "\n" in text else text[3:]
             if text.endswith("```"):
@@ -154,12 +223,12 @@ def parse_batch(client, descriptions: list[dict], retries: int = 3) -> list[dict
 
             if not isinstance(parsed, list):
                 logger.error("Expected list, got %s", type(parsed))
-                return [{}] * len(descriptions)
+                return [{}] * len(items)
 
             # Pad or trim to match input length
-            while len(parsed) < len(descriptions):
+            while len(parsed) < len(items):
                 parsed.append({})
-            parsed = parsed[:len(descriptions)]
+            parsed = parsed[:len(items)]
 
             return parsed
 
@@ -174,87 +243,208 @@ def parse_batch(client, descriptions: list[dict], retries: int = 3) -> list[dict
             logger.info("Retrying in %ds...", wait)
             time.sleep(wait)
 
-    return [{}] * len(descriptions)
+    return [{}] * len(items)
 
 
+# ---------------------------------------------------------------------------
+# Embedding & scoring
+# ---------------------------------------------------------------------------
+def truncate_description(desc: str, target: int = 80) -> str:
+    if not desc or len(desc) <= target:
+        return desc
+    idx = desc.find(" ", target)
+    if idx == -1:
+        return desc
+    return desc[:idx]
+
+
+def build_search_text(row: dict) -> str:
+    parts = [
+        row.get("brand") or "",
+        row.get("model") or "",
+        row.get("cpu") or "",
+        (row.get("description") or "")[:200],
+    ]
+    text = " ".join(p for p in parts if p).strip()
+    return text or "laptop"
+
+
+def to_db_row(raw_item: dict, specs: dict, embedding: list, now_str: str) -> dict:
+    """Merge raw scraped data + parsed specs + embedding + score into a DB row."""
+    out = {}
+
+    # Metadata from scraped item
+    out["avito_id"] = str(raw_item.get("avito_id", ""))
+    out["description"] = truncate_description(str(raw_item.get("description", "")))
+    out["link"] = str(raw_item.get("link", ""))
+    out["city"] = str(raw_item.get("city", ""))
+
+    # Price
+    try:
+        out["price"] = float(raw_item.get("price", 0) or 0)
+    except (ValueError, TypeError):
+        out["price"] = None
+
+    # Booleans
+    for col in BOOL_COLS:
+        val = raw_item.get(col, False)
+        if isinstance(val, bool):
+            out[col] = val
+        elif str(val).lower() in ("true", "1", "yes"):
+            out[col] = True
+        else:
+            out[col] = False
+
+    # Specs from Gemini
+    for col in SPEC_COLS:
+        val = specs.get(col)
+        if val is None or val == "null" or val == "":
+            if col in NUMERIC_COLS:
+                out[col] = None
+            else:
+                out[col] = ""
+        elif col in NUMERIC_COLS:
+            try:
+                out[col] = float(val)
+            except (ValueError, TypeError):
+                out[col] = None
+        else:
+            out[col] = str(val)
+
+    out["updated_at"] = now_str
+    out["is_sold"] = False  # Active item, always False
+    out["embedding"] = json.dumps(embedding)
+    out["score"] = calc_laptop_score(out)
+
+    return out
+
+
+def is_valid_parse(specs: dict) -> bool:
+    """Check that Gemini actually extracted something useful."""
+    brand = specs.get("brand")
+    cpu = specs.get("cpu")
+    model = specs.get("model")
+    # At least one of brand, cpu, or model must be non-empty
+    return bool(brand) or bool(cpu) or bool(model)
+
+
+# ---------------------------------------------------------------------------
+# Main processing loop
+# ---------------------------------------------------------------------------
 def main(max_items: int = None):
     if not GEMINI_KEY:
         print("Error: GEMINI_API_KEY not found in .env")
         return
-
-    client = genai.Client(api_key=GEMINI_KEY)
-
-    # Read input
-    if not INPUT_FILE.exists():
-        print(f"Error: {INPUT_FILE} not found. Run refresh.py first.")
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        print("Error: SUPABASE_URL/SUPABASE_KEY not found in .env")
         return
 
-    with open(INPUT_FILE, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        all_items = list(reader)
+    # Count how many items to process
+    total = count_new_laptops()
+    if total == 0:
+        print("new_laptops table is empty. Nothing to process.")
+        return
 
-    if max_items:
-        all_items = all_items[:max_items]
+    if max_items and total > max_items:
+        total = max_items
+    print(f"Processing {total} items from new_laptops table...")
 
-    total = len(all_items)
-    total_chunks = (total + API_CHUNK - 1) // API_CHUNK
-    print(f"Parsing {total} items ({total_chunks} API calls of {API_CHUNK} each)...")
-    print(f"Model: {MODEL}")
-    print()
+    # Load models
+    logger.info("Loading Gemini client...")
+    gemini_client = genai.Client(api_key=GEMINI_KEY)
+    logger.info("Loading embedding model (%s)...", EMBED_MODEL)
+    embed_model = SentenceTransformer(EMBED_MODEL)
+    logger.info("Models loaded.")
 
-    results = []
-    done = 0
+    now_str = datetime.now(timezone.utc).isoformat()
+    processed = 0
+    failed_ids = set()  # track items that have failed multiple times
+    max_loops = (total // GEMINI_BATCH + 1) * MAX_RETRIES  # safety limit
 
-    for chunk_start in range(0, total, API_CHUNK):
-        chunk_end = min(chunk_start + API_CHUNK, total)
-        chunk = all_items[chunk_start:chunk_end]
-        chunk_num = chunk_start // API_CHUNK + 1
+    for loop in range(max_loops):
+        # Fetch a batch
+        batch = fetch_new_laptops_batch(GEMINI_BATCH)
+        if not batch:
+            break  # table is empty, done!
 
-        try:
-            specs_list = parse_batch(client, chunk)
-        except Exception as e:
-            logger.error("Chunk %d failed permanently: %s", chunk_num, e)
-            specs_list = [{}] * len(chunk)
+        # Skip items that have already failed MAX_RETRIES times
+        fresh_batch = [item for item in batch if item["id"] not in failed_ids]
+        if not fresh_batch:
+            # All remaining items have failed too many times, give up
+            logger.warning("All remaining %d items failed parsing. Stopping.", len(batch))
+            break
 
-        # Merge scraped metadata with parsed specs
-        for item, specs in zip(chunk, specs_list):
-            row = {}
-            # Copy metadata columns from the scraped item
-            for col in ["avito_id", "description", "price", "city", "link",
-                         "is_shop", "has_delivery"]:
-                row[col] = item.get(col, "")
-            # Copy spec columns from Gemini output
-            for col in SPEC_COLS:
-                val = specs.get(col)
-                if val is None or val == "null":
-                    row[col] = ""
-                else:
-                    row[col] = val
-            results.append(row)
+        logger.info("--- Batch %d: %d items ---", loop + 1, len(fresh_batch))
 
-        done += len(chunk)
-        if done % REPORT_EVERY < API_CHUNK or done == total:
-            pct = done / total * 100
-            logger.info("Progress: %d/%d items (%.0f%%)", done, total, pct)
+        # Parse with Gemini
+        specs_list = parse_batch_gemini(gemini_client, fresh_batch)
 
-        # Rate limit: 15 RPM = 4s between calls, use 5s for safety
-        if chunk_end < total:
+        # Separate valid and invalid parses
+        valid_items = []
+        valid_specs = []
+        invalid_ids = []
+
+        for item, specs in zip(fresh_batch, specs_list):
+            if is_valid_parse(specs):
+                valid_items.append(item)
+                valid_specs.append(specs)
+            else:
+                invalid_ids.append(item["id"])
+                failed_ids.add(item["id"])
+                logger.warning("Failed to parse item id=%d avito_id=%s", item["id"], item.get("avito_id"))
+
+        if not valid_items:
+            logger.warning("No valid parses in this batch. Continuing...")
             time.sleep(5)
+            continue
 
-    # Write output
-    with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=ALL_COLS, extrasaction="ignore")
-        writer.writeheader()
-        for row in results:
-            writer.writerow(row)
+        # Generate embeddings
+        merged_rows = []
+        for item, specs in zip(valid_items, valid_specs):
+            merged = {**item, **specs}  # needed for build_search_text
+            merged_rows.append(merged)
 
-    print(f"\nDone! Saved {len(results)} parsed items to {OUTPUT_FILE}")
+        search_texts = [build_search_text(row) for row in merged_rows]
+        embeddings = embed_model.encode(search_texts, normalize_embeddings=True)
+
+        # Build DB rows
+        db_rows = []
+        processed_ids = []
+        for item, specs, emb in zip(valid_items, valid_specs, embeddings):
+            db_row = to_db_row(item, specs, emb.tolist(), now_str)
+            db_rows.append(db_row)
+            processed_ids.append(item["id"])
+
+        # Upsert into laptops
+        success = upsert_to_laptops(db_rows)
+        if success:
+            # Delete from new_laptops
+            delete_from_new_laptops(processed_ids)
+            processed += len(processed_ids)
+            remaining = count_new_laptops()
+            logger.info("Upserted %d items. Total processed: %d. Remaining: %d",
+                        len(processed_ids), processed, remaining)
+        else:
+            logger.error("Upsert failed for batch, items remain in new_laptops for retry.")
+
+        # Rate limit: Gemini 15 RPM = 4s between calls
+        time.sleep(5)
+
+        if max_items and processed >= max_items:
+            break
+
+    remaining = count_new_laptops()
+    print(f"\nProcessing complete!")
+    print(f"  Successfully processed: {processed}")
+    print(f"  Remaining in new_laptops: {remaining}")
+    if failed_ids:
+        print(f"  Failed items (ids): {sorted(failed_ids)}")
 
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Parse Avito laptop descriptions with Gemini")
+    parser = argparse.ArgumentParser(description="Parse and upload new laptops")
     parser.add_argument("-n", "--num", type=int, default=None,
-                        help="Max items to parse (default: all)")
+                        help="Max items to process (default: all)")
     args = parser.parse_args()
     main(args.num)
