@@ -33,7 +33,7 @@ GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 MODEL = "gemini-3.1-flash-lite-preview"
-GEMINI_BATCH = 50    # items per Gemini API call
+GEMINI_BATCH = 200    # items per Gemini API call
 MAX_RETRIES = 3      # max parse attempts per item
 
 # Columns that Gemini must extract
