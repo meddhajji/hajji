@@ -372,7 +372,22 @@ def main(max_items: int = None):
         # Build DB rows (no embeddings needed)
         db_rows = []
         processed_ids = []
+        seen_links = set()
+        seen_avito_ids = set()
+
         for item, specs in zip(valid_items, valid_specs):
+            link = item.get("link")
+            avito_id = str(item.get("avito_id", ""))
+
+            # Skip duplicates within the same batch to prevent ON CONFLICT 21000 errors
+            if link in seen_links or avito_id in seen_avito_ids:
+                logger.warning("Skipping duplicate in batch: avito_id=%s", avito_id)
+                processed_ids.append(item["id"])  # delete from staging anyway
+                continue
+
+            seen_links.add(link)
+            seen_avito_ids.add(avito_id)
+
             db_row = to_db_row(item, specs)
             db_rows.append(db_row)
             processed_ids.append(item["id"])

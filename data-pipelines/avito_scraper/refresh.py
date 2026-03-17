@@ -44,19 +44,8 @@ def _headers(content_type=True):
 # ---------------------------------------------------------------------------
 # Supabase helpers
 # ---------------------------------------------------------------------------
-def reset_all_is_sold():
-    """Reset is_sold=False for ALL items at the start of each update."""
-    logger.info("Resetting all items to is_sold=False...")
-    # Supabase REST API: patch all rows (no filter = all rows)
-    url = f"{SUPABASE_URL}/rest/v1/laptops?is_sold=eq.true"
-    resp = requests.patch(url, headers=_headers(), json={"is_sold": False})
-    if not resp.ok:
-        logger.error("Reset is_sold failed: %d %s", resp.status_code, resp.text[:200])
-    else:
-        logger.info("All items reset to is_sold=False.")
-
 def fetch_db_items():
-    """Fetch link, avito_id, price from every row in laptops."""
+    """Fetch link, avito_id, price, is_sold from every row in laptops."""
     logger.info("Fetching current database items...")
     all_rows = []
     offset = 0
@@ -65,7 +54,7 @@ def fetch_db_items():
     while True:
         url = (
             f"{SUPABASE_URL}/rest/v1/laptops"
-            f"?select=link,avito_id,price"
+            f"?select=link,avito_id,price,is_sold"
             f"&order=id.asc"
             f"&offset={offset}&limit={step}"
         )
@@ -143,6 +132,26 @@ def mark_sold(links_not_found: set[str], db_items: list[dict]):
         time.sleep(0.1)
     logger.info("Marked %d items as sold.", len(sold_ids))
 
+def unsell_active(links_found: set[str], db_items: list[dict]):
+    """Set is_sold=False for DB items that ARE in the scrape (un-sell relisted items)."""
+    # Only un-sell items that were previously sold
+    relisted_ids = [
+        str(row["avito_id"]) for row in db_items
+        if row.get("link") in links_found and row.get("is_sold") is True
+    ]
+    if not relisted_ids:
+        return
+    # Batched update
+    batch_size = 500
+    for i in range(0, len(relisted_ids), batch_size):
+        batch = relisted_ids[i:i + batch_size]
+        ids_param = ",".join(batch)
+        url = f"{SUPABASE_URL}/rest/v1/laptops?avito_id=in.({ids_param})"
+        resp = requests.patch(url, headers=_headers(), json={"is_sold": False})
+        if not resp.ok:
+            logger.error("Un-sell failed: %d %s", resp.status_code, resp.text[:200])
+        time.sleep(0.1)
+    logger.info("Confirmed/Reverted %d items to active (is_sold=False).", len(relisted_ids))
 
 
 
@@ -240,6 +249,7 @@ def diff_and_act(scraped_ads: list[dict], db_items: list[dict]):
     insert_into_new_laptops(new_items)
     patch_prices(price_updates)
     mark_sold(links_not_found, db_items)
+    unsell_active(links_found, db_items)
 
     total_new = stats["new"] + stats["recycled"]
     save_pipeline_stats(total_new)
@@ -257,10 +267,7 @@ def main(max_pages: int = 500):
         print("Error: SUPABASE_URL/SUPABASE_KEY not found in .env")
         return
 
-    # 1. Reset all is_sold to False
-    reset_all_is_sold()
-
-    # 2. Fetch current DB state
+    # 1. Fetch current DB state
     db_items = fetch_db_items()
 
     # 2. Scrape Avito

@@ -109,7 +109,7 @@ const ALL_COLUMNS: ColDef[] = [
     { key: "gpu", label: "GPU", defaultOn: true, render: (l) => <span className="max-w-[120px] truncate block">{l.gpu || "—"}</span> },
     { key: "price", label: "Price", defaultOn: true, align: "right", render: (l) => l.price ? <span className="font-semibold">{l.price.toLocaleString()} DH</span> : "—" },
     { key: "city", label: "City", defaultOn: true, render: (l) => l.city || "—" },
-    { key: "new", label: "New", defaultOn: true, width: "w-[60px]", render: (l) => l.new === 1 ? <Badge variant="secondary" className="text-xs">New</Badge> : (l.new === 0 ? <span className="text-xs text-muted-foreground">Used</span> : "—") },
+    { key: "new", label: "Condition", defaultOn: true, width: "w-[60px]", render: (l) => l.new === 1 ? <Badge variant="secondary" className="text-xs">New</Badge> : (l.new === 0 ? <span className="text-xs text-muted-foreground">Used</span> : "—") },
     { key: "gpu_type", label: "GPU type", defaultOn: false, render: (l) => l.gpu_type || "—" },
     { key: "gpu_vram", label: "VRAM", defaultOn: false, align: "right", render: (l) => (l.gpu_vram != null ? `${l.gpu_vram}` : "—") },
     { key: "screen_size", label: "Screen", defaultOn: false, align: "right", render: (l) => (l.screen_size != null ? `${l.screen_size}"` : "—") },
@@ -121,11 +121,11 @@ const ALL_COLUMNS: ColDef[] = [
     { key: "link", label: "Link", defaultOn: false, render: (l) => l.link ? <a href={l.link} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:underline text-xs">Avito ↗</a> : "—" },
     { key: "description", label: "Description", defaultOn: false, render: (l) => <span className="max-w-[200px] truncate block text-xs">{l.description || "—"}</span> },
     { key: "avito_id", label: "Avito ID", defaultOn: false, render: (l) => <span className="text-xs">{l.avito_id || "—"}</span> },
-    { key: "status", label: "Status", defaultOn: true, width: "w-[70px]", align: "center", render: (l) => {
+    { key: "status", label: "Recency", defaultOn: true, width: "w-[70px]", align: "center", render: (l) => {
         if (l.is_sold) return <Badge variant="destructive" className="text-[10px] uppercase font-bold tracking-wider opacity-80 py-0 leading-tight">Sold</Badge>;
         const created = new Date(l.created_at);
         const hoursAgo = (Date.now() - created.getTime()) / (1000 * 60 * 60);
-        if (hoursAgo < 48) return <Badge className="bg-emerald-500/20 text-emerald-400 border-emerald-500/30 text-[10px] uppercase font-bold tracking-wider py-0 leading-tight">New!</Badge>;
+        if (hoursAgo < 48) return <Badge className="bg-emerald-500/20 text-emerald-400 border-emerald-500/30 text-[10px] uppercase font-bold tracking-wider py-0 leading-tight">New</Badge>;
         return null;
     }},
 ];
@@ -322,7 +322,7 @@ export default function AvitoPage() {
 
         let query = supabase
             .from("laptops")
-            .select("*", { count: "estimated" });
+            .select("*", { count: "exact", head: false });
 
         if (activeFilters.brand) query = query.ilike("brand", `%${activeFilters.brand}%`);
         if (activeFilters.city) query = query.ilike("city", `%${activeFilters.city}%`);
